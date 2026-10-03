@@ -28,6 +28,14 @@
   整表替换, 空表清除全部锁定); 锁定仅约束普通分配, 不改变补位规则;
   被锁评审人失格时锁定行不级联, 由预演/发布诊断冲突并拒绝发布, 不悄悄释放,
   论文删除时其锁定行随论文级联清除;
+- feedback_objections 表保存作者凭"当前有效的快照访问码"对标号 1/2 评语提交的异议
+  (同一快照同一标号仅一条: UNIQUE(snapshot_id, label); 相同理由重试返回原记录,
+  不同理由冲突); 提交即冻结该标号在快照中的评分与评语并发放随机查询凭据
+  (obj- 前缀, query_token 全局唯一), 持凭据可随时查看处理状态, 与访问码此后是否
+  失效无关; state: pending(待处理) / rejected(驳回, 不影响快照) / accepted(受理,
+  已走既有评语更正请求流程) / expired(发布序号变化后未处理异议过期, 仅供会务方追溯);
+  每次发布 (含补位发布) 推进发布序号时, 旧序号下仍 pending 的异议在同一事务内
+  原子标记 expired, 历史行永久保留;
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -183,6 +191,37 @@ CREATE TABLE IF NOT EXISTS review_corrections (
     requested_at         TEXT NOT NULL,
     corrected_at         TEXT
 );
+-- 作者面向反馈快照中标号 1/2 评语提交的异议。
+-- 作者身份即"持当前有效快照访问码者": 提交时核对访问码存在且当前仍有效
+-- (快照序号为当前发布序号且未被更正请求失效); 同一快照同一标号至多一条
+-- (UNIQUE 约束兜底并发, 写事务 BEGIN IMMEDIATE 串行化保证并发提交不生成两条)。
+-- 提交时冻结该标号在快照中的评分/评语 (frozen_review_json) 与目标评语收据
+-- (target_receipt, 仅会务方视图使用), 发放随机查询凭据 query_token:
+-- 凭据查询不依赖访问码此后是否有效, 即使快照码随发布序号变化/更正请求失效,
+-- 持凭据仍可查看处理状态; 已失效访问码不得再提交新异议。
+-- pending: 待会务方处理; rejected: 会务方驳回 (不影响快照, 记录驳回说明);
+-- accepted: 会务方受理 (受理时原子核对发布序号仍为当前序号、目标评语收据未变、
+--   无既有待更正请求, 按匿名标号定位评审人并走既有更正请求流程, 快照访问码
+--   随之立即失效, 关联更正请求 id);
+-- expired: 发布序号变化 (普通发布/补位发布) 时仍未处理的异议在同一事务内
+--   原子过期, 历史永久保留供会务方追溯。
+CREATE TABLE IF NOT EXISTS feedback_objections (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id        INTEGER NOT NULL,    -- 异议所针对的快照版本
+    paper_id           TEXT NOT NULL,
+    serial             INTEGER NOT NULL,    -- 快照发布序号 (异议提交时的当前序号)
+    label              INTEGER NOT NULL CHECK (label IN (1, 2)),
+    reason             TEXT NOT NULL,       -- 作者填写的非空异议理由
+    frozen_review_json TEXT NOT NULL,       -- 冻结 JSON: {"score":..,"comment":..}
+    target_receipt     TEXT NOT NULL,       -- 目标评语收据 (提交时冻结, 受理时核对)
+    state              TEXT NOT NULL CHECK (state IN ('pending', 'rejected', 'accepted', 'expired')),
+    query_token        TEXT NOT NULL UNIQUE, -- 随机查询凭据 (obj- 前缀, 全局唯一)
+    resolution_note    TEXT,                -- 驳回说明 (会务方可填) / 受理时的更正原因
+    correction_id      INTEGER,             -- 受理后关联的既有更正请求 id
+    created_at         TEXT NOT NULL,
+    decided_at         TEXT,                -- 驳回/受理时间; 序号变化过期时同事务写入
+    UNIQUE (snapshot_id, label)
+);
 """
 
 
@@ -301,6 +340,20 @@ def load_assignment_locks(conn: sqlite3.Connection):
             "SELECT paper_id, reviewers_json FROM assignment_locks ORDER BY paper_id"
         ).fetchall()
     }
+
+
+def expire_pending_objections(conn: sqlite3.Connection, new_serial: int, now: str) -> int:
+    """发布序号推进为 new_serial 时, 在同一写事务内把旧序号下仍 pending 的异议标记过期。
+
+    未处理异议随发布序号变化过期 (普通发布/补位发布均须调用);
+    已驳回/已受理的异议为终态, 不改动; 过期行永久保留供会务方追溯。
+    返回本次标记过期的异议条数。
+    """
+    return conn.execute(
+        "UPDATE feedback_objections SET state = 'expired', decided_at = ?"
+        " WHERE state = 'pending' AND serial < ?",
+        (now, new_serial),
+    ).rowcount
 
 
 @contextmanager
