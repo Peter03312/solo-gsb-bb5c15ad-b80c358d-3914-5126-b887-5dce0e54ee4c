@@ -28,6 +28,13 @@
   整表替换, 空表清除全部锁定); 锁定仅约束普通分配, 不改变补位规则;
   被锁评审人失格时锁定行不级联, 由预演/发布诊断冲突并拒绝发布, 不悄悄释放,
   论文删除时其锁定行随论文级联清除;
+- feedback_objections 表保存作者凭有效快照访问码对标号 1/2 评语提交的异议
+  (同一快照同一标号仅一条, 以 UNIQUE(snapshot_id, label) 保证并发不生成两条;
+  相同理由重试幂等返回原记录与原查询凭据, 不同理由冲突; 提交时冻结该标号对应的
+  评语收据供受理时定位评审人, 作者视图绝不暴露评审人编号/机构/收据;
+  提交返回随机查询凭据 query_token, 快照码失效后仍可凭其查询处理状态;
+  会务方驳回不影响快照, 受理须填写非空更正原因并原子核对发布序号与目标收据后
+  走既有更正请求流程; 未处理异议随发布序号变化标记 superseded, 历史保留供追溯);
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -182,6 +189,33 @@ CREATE TABLE IF NOT EXISTS review_corrections (
     new_receipt          TEXT,               -- 更正评语的新收据
     requested_at         TEXT NOT NULL,
     corrected_at         TEXT
+);
+-- 作者凭当前有效快照访问码对标号 1/2 评语提交的异议。
+-- 同一快照同一标号仅留一条 (UNIQUE(snapshot_id, label), 并发提交也不会生成两条):
+-- 相同理由 (首尾空白归一化后一致) 的重试幂等返回原记录与原查询凭据,
+-- 不同理由按冲突拒绝; 提交仅在快照当前有效 (序号仍为当前发布序号且未被失效) 时接受,
+-- 已失效访问码提交一律按无效码 404 处理。
+-- receipt 冻结提交时该标号对应的评语收据, 仅供会务方追溯与受理时按匿名标号
+-- 定位评审人 (经当前序号的评语行反查), 绝不出现在作者视图中;
+-- query_token 为提交时发放的随机查询凭据, 快照码失效后仍可凭它查询处理状态;
+-- state: pending(待处理) / rejected(已驳回, 不影响快照) / accepted(已受理,
+-- 已按既有更正请求流程生成待更正请求并令原访问码失效) / superseded
+-- (未处理异议随发布序号变化标记过期, 历史保留供会务方追溯)。
+CREATE TABLE IF NOT EXISTS feedback_objections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id        TEXT NOT NULL,
+    serial          INTEGER NOT NULL,   -- 提交时快照所依附的发布序号
+    snapshot_id     INTEGER NOT NULL,   -- 对应 feedback_snapshots.id (冻结来源版本)
+    label           INTEGER NOT NULL CHECK (label IN (1, 2)),
+    reason          TEXT NOT NULL,      -- 非空异议理由 (首尾空白归一化后)
+    receipt         TEXT NOT NULL,      -- 该标号对应的评语收据 (仅会务方可见)
+    query_token     TEXT NOT NULL UNIQUE,  -- 随机查询凭据 (obj- 前缀)
+    state           TEXT NOT NULL CHECK (state IN ('pending', 'rejected', 'accepted', 'superseded')),
+    decision_reason TEXT,               -- 会务方处理原因 (受理=非空更正原因, 驳回可选)
+    correction_id   INTEGER,            -- 受理时关联的 review_corrections.id
+    created_at      TEXT NOT NULL,
+    resolved_at     TEXT,
+    UNIQUE (snapshot_id, label)
 );
 """
 

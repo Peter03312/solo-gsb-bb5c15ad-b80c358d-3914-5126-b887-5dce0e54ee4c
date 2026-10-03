@@ -103,3 +103,20 @@ class ReviewCorrectionSubmitIn(BaseModel):
     original_receipt: str = Field(min_length=1, max_length=128, description="被更正评语的收据")
     score: StrictInt = Field(ge=1, le=5, description="更正后的 1~5 整数评分")
     comment: str = Field(min_length=1, max_length=10000, description="更正后的非空评语")
+
+
+class ObjectionSubmitIn(BaseModel):
+    """作者凭当前有效快照访问码对某标号评语提交的异议。"""
+
+    label: StrictInt = Field(ge=1, le=2, description="快照中评语的匿名标号 (1 或 2)")
+    reason: str = Field(min_length=1, max_length=2000, description="非空异议理由 (首尾空白归一化后仍须非空)")
+
+
+class ObjectionResolveIn(BaseModel):
+    """会务方对异议的处理决定: 驳回 (不影响快照) 或受理 (走既有更正请求流程)。"""
+
+    decision: Literal["reject", "accept"] = Field(description="reject=驳回, accept=受理")
+    reason: Optional[str] = Field(
+        default=None, max_length=1000,
+        description="受理时必填的非空更正原因 (首尾空白归一化后仍须非空); 驳回时可选",
+    )
